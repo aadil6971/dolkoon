@@ -33,6 +33,20 @@ struct Packet: Identifiable {
     var proto = ""           // highest protocol found
     var info = ""
     var top = 1              // OSI number of that protocol
+    var story = ""           // plain-English sentence; {S} and {D} become friendly names (see PacketCapture.finish)
+    var why = ""             // why this packet exists, for someone new to networking
+    var learned: [(ip: String, name: String)] = []
+    var noise = false        // a bare TCP "got it" with no data
+    var srcIP = "", dstIP = ""
+    var srcName = "", dstName = ""
+    var sent: Bool?          // true = left this Mac, false = arrived here, nil = neither
+    var group = ""           // story template with {N} for the amount; packets with the same template and ends can merge
+    var encrypted = false
+    var appBytes = 0         // bytes of the app's own data (after all headers)
+    var sport = 0, dport = 0
+    var link: UInt32 = 1
+    var app = ""             // the Mac app that owns this conversation, when lsof can tell
+    var appPath = ""         // its executable, for the real app icon
 
     func layer(_ n: Int) -> OSILayer { layers[n - 1] }
 
@@ -99,6 +113,7 @@ enum PacketDecoder {
         }
 
         // Layer 3
+        var st = Story()
         var ipProto = -1
         var end = n
         var srcIP = "", dstIP = ""
@@ -140,9 +155,15 @@ enum PacketDecoder {
                                      Field("Note", "ARP finds the MAC address for an IP — it sits between layers 2 and 3")],
                             range: off..<off + 28)
             p.src = sip; p.dst = op == 1 ? "broadcast" : tip
+            p.srcIP = sip; p.dstIP = op == 1 ? "broadcast" : tip
+            st = op == 1
+                ? Story("{S} shouted to every device nearby: “Who has \(tip)?”",
+                        "Before sending anything to \(tip) (often your router), your Mac needs its hardware address. ARP is how it asks.")
+                : Story("{S} answered: “\(sip) is me — my hardware address is \(smac)”",
+                        "Now the asker can put the right hardware (MAC) address on its frames.")
         default: break
         }
-        if !srcIP.isEmpty { p.src = srcIP; p.dst = dstIP }
+        if !srcIP.isEmpty { p.src = srcIP; p.dst = dstIP; p.srcIP = srcIP; p.dstIP = dstIP }
 
         // Layer 4 (ICMP lives in layer 3)
         var payload = 0..<0
@@ -156,6 +177,7 @@ enum PacketDecoder {
             L[2].fields.append(Field(name + " type", "\(b[off]) code \(b[off + 1])"))
             L[2].range = (L[2].range?.lowerBound ?? off)..<min(end, off + 8)
             L[3].summary = "\(name) is a network-layer message — no ports"
+            st = icmpStory(v6: ipProto == 58, type: Int(b[off]))
         case 6 where off + 20 <= end:
             transport = "TCP"
             sport = u16(off); dport = u16(off + 2)
@@ -173,6 +195,21 @@ enum PacketDecoder {
                 L[4] = OSILayer(osi: 5, proto: "TCP · handshake",
                                 summary: flags & 0x10 != 0 ? "Step 2 of 3: server agrees to open the connection" : "Step 1 of 3: asks to open a connection")
             } else if flags & 0x01 != 0 { L[4] = OSILayer(osi: 5, proto: "TCP · closing", summary: "Says goodbye — closing the connection (FIN)") }
+            let door = portPhrase(knownPorts[dport] != nil || sport > dport ? dport : sport)
+            if flags & 0x04 != 0 {
+                st = Story("{S} hung up on {D}", "RST cuts a connection off at once — often the port is closed or the app gave up.")
+            } else if flags & 0x02 != 0, flags & 0x10 == 0 {
+                st = Story("{S} knocked on {D}'s door (\(door)): “Can we talk?”",
+                           "Step 1 of TCP's 3-step handshake. TCP sends nothing real until both sides agree to talk.")
+            } else if flags & 0x02 != 0 {
+                st = Story("{S} said “Yes, let's talk” to {D}", "Step 2 of 3. Next the first side says “got it”, and the connection is open.")
+            } else if flags & 0x01 != 0 {
+                st = Story("{S} said goodbye to {D}", "FIN closes the conversation politely — each side says goodbye once.")
+            } else if payload.isEmpty {
+                st = Story(group: "{S} told {D}: “Got it”",
+                           "TCP confirms everything it receives. If a confirmation never comes, the sender sends that piece again — that's how nothing gets lost.")
+                p.noise = true
+            }
         case 17 where off + 8 <= end:
             transport = "UDP"
             sport = u16(off); dport = u16(off + 2)
@@ -192,7 +229,11 @@ enum PacketDecoder {
         }
 
         // Layers 5–7
-        if !transport.isEmpty { decodeApp(&L, b, payload, transport, sport, dport) }
+        if !transport.isEmpty { decodeApp(&L, &st, b, payload, transport, sport, dport, srcIP, dstIP) }
+        if st.text.isEmpty {
+            st = L[2].present ? Story("{S} sent a \(L[2].proto) packet to {D}", "")
+                : Story("A \(L[1].proto.isEmpty ? "link-level" : L[1].proto) frame: \(L[1].summary)", "This frame never goes past the local network.")
+        }
 
         // Fill quiet layers with a plain reason.
         if !L[4].present, L[4].summary.isEmpty { L[4].summary = transport.isEmpty ? "—" : "Not separate here — \(transport) and the app handle it" }
@@ -207,10 +248,14 @@ enum PacketDecoder {
         p.proto = shortName(topLayer.proto)
         p.info = topLayer.summary
         if p.src.isEmpty { p.src = L[1].fields.first?.value ?? "" ; p.dst = L[1].fields.dropFirst().first?.value ?? "" }
+        p.story = st.text; p.why = st.why; p.learned = st.learned
+        p.group = st.group; p.encrypted = st.encrypted; p.appBytes = payload.count
+        p.sport = sport; p.dport = dport; p.link = linkType
         return p
     }
 
-    private static func decodeApp(_ L: inout [OSILayer], _ b: [UInt8], _ r: Range<Int>, _ t: String, _ sp: Int, _ dp: Int) {
+    private static func decodeApp(_ L: inout [OSILayer], _ st: inout Story, _ b: [UInt8], _ r: Range<Int>, _ t: String, _ sp: Int, _ dp: Int,
+                                  _ srcIP: String, _ dstIP: String) {
         let data = Array(b[r])
         let port = knownPorts[dp] != nil ? dp : knownPorts[sp] != nil ? sp : min(sp, dp)
         let service = knownPorts[port]
@@ -222,6 +267,19 @@ enum PacketDecoder {
         if [53, 5353, 5355].contains(port), let d = dns(t == "TCP" ? Array(data.dropFirst(2)) : data) {
             let name = port == 5353 ? "mDNS" : port == 5355 ? "LLMNR" : "DNS"
             L[6] = OSILayer(osi: 7, proto: name, summary: d.summary, fields: d.fields, range: r)
+            if port == 5353 || port == 5355 {
+                let what = serviceName(d.qname)
+                st = d.response
+                    ? Story("{S} told nearby devices: “I'm here\(what.map { " — I offer \($0)" } ?? "")”", "Bonjour (mDNS) lets Apple devices, printers and speakers find each other without any setup.")
+                    : Story("{S} asked nearby devices: “\(what.map { "Who offers \($0)?" } ?? "Who is \(d.qname)?")”", "Bonjour (mDNS) lets Apple devices, printers and speakers find each other without any setup.")
+            } else if d.response {
+                st = Story("{S} replied: “\(d.qname) is at \(d.answers.isEmpty ? "(no address)" : d.answers.joined(separator: ", "))”",
+                           "Like getting a phone number back. Now the asker knows where to send the real request.")
+                st.learned = d.answers.filter { $0.first?.isNumber == true || $0.contains(":") }.map { ($0, d.qname) }
+            } else {
+                st = Story("{S} asked {D}: “What's the address of \(d.qname)?”",
+                           "Computers find each other by number (IP address), not by name. DNS is the internet's phone book.")
+            }
             return
         }
         // TLS
@@ -242,6 +300,20 @@ enum PacketDecoder {
                 }
             }
             let start = r.lowerBound
+            let hsType = data[0] == 22 && data.count > 5 ? Int(data[5]) : -1
+            switch (Int(data[0]), hsType) {
+            case (22, 1):
+                st = Story("{S} started a secure, encrypted conversation with \(host ?? "{D}")",
+                           "This hello is the last part anyone in between can read. It shows the website's name, but everything after it is locked.")
+                if let host { st.learned = [(dstIP, host)] }
+            case (22, 2): st = Story("{S} replied with its encryption choice — the secure line is almost ready", "Both sides now make secret keys that only they know.")
+            case (22, 11): st = Story("{S} showed its ID card (certificate)", "Your Mac checks this certificate to make sure it's really talking to that website.")
+            case (22, _): st = Story("{S} and {D} are agreeing on secret keys", "Part of the TLS handshake that sets up encryption.")
+            case (23, _): st = Story(flow: "{S} sent {N} of encrypted data to {D}", data.count, "Locked by TLS. Nobody in between — not even your Wi-Fi or internet provider — can read it.")
+            case (21, _): st = Story("{S} sent a TLS alert to {D}", "Usually means the secure line is closing.")
+            default: st = Story("{S} switched to encrypted mode", "From here on, everything is locked.")
+            }
+            st.encrypted = true
             L[4] = OSILayer(osi: 5, proto: "TLS session", summary: data[0] == 22 ? "Handshake sets up a secure session" : "Inside an open TLS session")
             L[5] = OSILayer(osi: 6, proto: "TLS", summary: s, fields: f, range: start..<start + 5)
             L[6] = OSILayer(osi: 7, proto: service.map { $0 == "HTTP" ? "HTTPS" : $0 } ?? "Encrypted app",
@@ -256,6 +328,10 @@ enum PacketDecoder {
             L[5] = OSILayer(osi: 6, proto: "QUIC · TLS 1.3", summary: "\(kind) packet — encryption built into QUIC",
                             fields: [Field("Packet", kind)] + (long && data.count >= 5 ? [Field("Version", String(format: "0x%08x", UInt32(data[1]) << 24 | UInt32(data[2]) << 16 | UInt32(data[3]) << 8 | UInt32(data[4])))] : []))
             L[6] = OSILayer(osi: 7, proto: "HTTP/3", summary: "Web traffic over QUIC — hidden by encryption", range: r)
+            st = long && kind == "Initial"
+                ? Story("{S} started a fast, encrypted QUIC connection with {D}", "QUIC is the newer way to load websites (HTTP/3). It runs on UDP and is encrypted from the very first packet.")
+                : Story(flow: "{S} sent {N} of encrypted web data to {D} (HTTP/3)", data.count, "QUIC traffic — encrypted, so only the two ends can read it.")
+            st.encrypted = true
             return
         }
         // HTTP
@@ -265,6 +341,14 @@ enum PacketDecoder {
                 f.append(Field("Host", host.dropFirst(5).trimmingCharacters(in: .whitespaces)))
             }
             L[6] = OSILayer(osi: 7, proto: "HTTP", summary: firstLine, fields: f, range: r)
+            let words = firstLine.split(separator: " ")
+            if text.hasPrefix("HTTP") {
+                st = Story("{S} answered: “\(words.dropFirst().joined(separator: " "))”", "A plain-HTTP reply. Anyone on the network could read it, unlike HTTPS.")
+            } else {
+                let host = f.count > 1 ? f[1].value : "{D}"
+                st = Story("{S} asked \(host) for \(words.count > 1 ? String(words[1]) : "a page") — not encrypted",
+                           "Plain HTTP: anyone on your network could read this. With HTTPS this same request would be locked.")
+            }
             L[5] = OSILayer(osi: 6, summary: "Not encrypted — anyone on the path can read this")
             return
         }
@@ -272,15 +356,21 @@ enum PacketDecoder {
         if port == 22 {
             if text.hasPrefix("SSH-") {
                 L[6] = OSILayer(osi: 7, proto: "SSH", summary: "Hello: \(firstLine)", range: r)
+                st = Story("{S} said hello and named its SSH version", "SSH is how you log in to another computer's terminal, safely.")
             } else {
                 L[5] = OSILayer(osi: 6, proto: "SSH encryption", summary: "Encrypted by SSH")
                 L[6] = OSILayer(osi: 7, proto: "SSH", summary: "Remote terminal — hidden by encryption", range: r)
+                st = Story(flow: "{S} sent {N} of encrypted terminal traffic to {D}", data.count, "SSH keeps remote-login keystrokes and output locked.")
+                st.encrypted = true
             }
             return
         }
         // SSDP and other plain text
         if port == 1900 {
             L[6] = OSILayer(osi: 7, proto: "SSDP", summary: firstLine.isEmpty ? "Device discovery" : firstLine, range: r)
+            st = text.hasPrefix("M-SEARCH")
+                ? Story("{S} asked nearby TVs, speakers and routers to say who they are", "SSDP is how smart devices find each other on a home network.")
+                : Story("{S} announced itself to nearby devices", "SSDP is how smart devices find each other on a home network.")
             return
         }
         if [67, 68].contains(port) {
@@ -293,6 +383,7 @@ enum PacketDecoder {
                 }
             }
             L[6] = OSILayer(osi: 7, proto: "DHCP", summary: s, range: r)
+            st = Story("{S}: “\(s.components(separatedBy: " — ").last ?? s)”", "DHCP is how a device gets its IP address when it joins a network.")
             return
         }
         if let service {
@@ -301,12 +392,65 @@ enum PacketDecoder {
                 L[5] = OSILayer(osi: 6, proto: service == "WireGuard" || service == "IPsec" ? service : "TLS", summary: "Encrypted bytes (continued)")
             }
             L[6] = OSILayer(osi: 7, proto: service, summary: "\(data.count) bytes of \(service) data", range: r)
+            st = service == "NTP" ? Story("{S} asked {D} what time it is", "NTP keeps your Mac's clock exact.")
+                : Story(flow: "{S} sent {N} of \(service) data to {D}", data.count, encrypted ? "Encrypted — only the two ends can read it." : "")
+            st.encrypted = encrypted
         } else {
             L[6] = OSILayer(osi: 7, proto: "Data", summary: "\(data.count) bytes for port \(port)", range: r)
+            st = Story(flow: "{S} sent {N} to {D} (port \(port))", data.count, "")
         }
     }
 
     // MARK: helpers
+
+    struct Story {
+        var text = "", why = "", group = ""
+        var encrypted = false
+        var learned: [(ip: String, name: String)] = []
+        init(_ text: String = "", _ why: String = "") { self.text = text; self.why = why }
+        /// A repeatable "sent N bytes" line; runs of these collapse into one row.
+        init(flow: String, _ n: Int, _ why: String) {
+            text = flow.replacingOccurrences(of: "{N}", with: PacketDecoder.sizeWords(n)); group = flow; self.why = why
+        }
+        init(group: String, _ why: String) { text = group; self.group = group; self.why = why }
+    }
+
+    static func icmpStory(v6: Bool, type: Int) -> Story {
+        switch (v6, type) {
+        case (false, 8), (true, 128): return Story("{S} pinged {D}: “Are you there?”", "Ping checks if a computer can be reached, and how long the round trip takes.")
+        case (false, 0), (true, 129): return Story("{S} answered the ping: “Yes, I'm here”", "The time between ping and reply is your latency.")
+        case (false, 3), (true, 1): return Story("{S} told {D}: “I can't deliver that”", "A router or computer says a packet could not reach where it was going.")
+        case (false, 11), (true, 3): return Story("{S} told {D}: “Your packet ran out of hops”", "Its TTL hit zero. Traceroute uses this trick on purpose to map the path.")
+        case (true, 135): return Story("{S} asked: “Who has this IPv6 address?”", "IPv6's version of ARP — finding a neighbour's hardware address.")
+        case (true, 136): return Story("{S} answered: “That IPv6 address is me”", "IPv6's version of an ARP reply.")
+        case (true, 133): return Story("{S} asked: “Is there a router here?”", "A device joining an IPv6 network looks for its router.")
+        case (true, 134): return Story("{S} announced: “I'm the router here”", "Routers tell devices how to get onto the internet.")
+        default: return Story("{S} sent a control message to {D}", "ICMP carries network status messages, not app data.")
+        }
+    }
+
+    static let portWords: [Int: String] = [
+        22: "remote login", 25: "email", 53: "DNS", 80: "websites", 123: "time", 443: "secure websites", 445: "file sharing",
+        587: "email", 993: "email", 5223: "Apple notifications", 5900: "screen sharing", 7000: "AirPlay", 8080: "websites",
+        8443: "secure websites", 11434: "Ollama",
+    ]
+
+    static func portPhrase(_ p: Int) -> String { portWords[p].map { "port \(p) — \($0)" } ?? "port \(p)" }
+
+    static func sizeWords(_ n: Int) -> String {
+        n < 1000 ? "\(n) bytes" : n < 1_000_000 ? String(format: "%.1f KB", Double(n) / 1000) : String(format: "%.1f MB", Double(n) / 1e6)
+    }
+
+    /// Friendly name for a Bonjour service like "_airplay._tcp.local".
+    static func serviceName(_ q: String) -> String? {
+        let m = ["_airplay": "AirPlay", "_raop": "AirPlay speakers", "_googlecast": "Chromecast", "_spotify-connect": "Spotify Connect",
+                 "_companion-link": "Apple device pairing", "_ipp": "printing", "_ipps": "printing", "_printer": "printing",
+                 "_smb": "file sharing", "_afpovertcp": "file sharing", "_hap": "HomeKit", "_homekit": "HomeKit", "_sleep-proxy": "Sleep Proxy",
+                 "_device-info": "device info", "_rdlink": "Apple remote link", "_ssh": "remote login", "_sftp-ssh": "file transfer",
+                 "_matter": "Matter smart home", "_meshcop": "Thread smart home", "_airdrop": "AirDrop"]
+        guard let key = q.split(separator: ".").first(where: { $0.hasPrefix("_") && !["_tcp", "_udp", "_sub"].contains($0) }) else { return nil }
+        return m[String(key)] ?? String(key.dropFirst())
+    }
 
     static let knownPorts: [Int: String] = [
         20: "FTP", 21: "FTP", 22: "SSH", 25: "SMTP", 53: "DNS", 67: "DHCP", 68: "DHCP", 80: "HTTP", 123: "NTP", 137: "NetBIOS",
@@ -353,7 +497,7 @@ enum PacketDecoder {
         return inet_ntop(AF_INET6, &addr, &buf, socklen_t(buf.count)).map { String(cString: $0) } ?? "?"
     }
 
-    static func dns(_ d: [UInt8]) -> (summary: String, fields: [Field])? {
+    static func dns(_ d: [UInt8]) -> (summary: String, fields: [Field], response: Bool, qname: String, answers: [String])? {
         guard d.count >= 12 else { return nil }
         func u16(_ i: Int) -> Int { i + 1 < d.count ? Int(d[i]) << 8 | Int(d[i + 1]) : 0 }
         func name(_ start: Int) -> (String, Int) {
@@ -395,7 +539,7 @@ enum PacketDecoder {
             : qtype == "AAAA" ? "What is the IPv6 address of \(qname)?"
             : qtype == "PTR" ? (qname.contains("._tcp") || qname.contains("._udp") ? "Who offers \(qname)?" : "Which name has \(qname)?")
             : "Asks for the \(qtype) record of \(qname)"
-        return (summary, f)
+        return (summary, f, isResponse, qname, answers)
     }
 
     static func clientHello(_ d: [UInt8]) -> (sni: String?, alpn: String?)? {
@@ -439,6 +583,24 @@ final class PacketCapture: ObservableObject {
     @Published var rate: Double = 0
     @Published var total = 0
     @Published var counts: [String: Int] = [:]
+    @Published var conversations: [String: Conversation] = [:]
+    @Published var lockedBytes = 0     // app data that was encrypted
+    @Published var readableBytes = 0   // app data anyone on the path could read
+
+    /// Everything between this Mac and one other end for one service.
+    struct Conversation: Identifiable {
+        let id: String
+        var remoteIP: String
+        var name: String
+        var service: String
+        var app = ""
+        var appPath = ""
+        var top = 1
+        var packets = 0
+        var bytesIn = 0, bytesOut = 0
+        var encrypted = false, readable = false
+        var first: Date, last: Date
+    }
 
     static let keep = 3000
     private var proc: Process?
@@ -452,6 +614,11 @@ final class PacketCapture: ObservableObject {
     private var swapped = false, nano = false, gotHeader = false
     private var stderrText = ""
     private var source = ""
+    private var names: [String: String] = [:]   // IP → name learned from DNS answers and TLS hellos
+    private var localIPs = Set<String>()
+    private var gateway = ""
+    private var ports: [Int: (name: String, path: String)] = [:]   // local port → app, from lsof
+    private var portsAt = Date.distantPast
 
     var interfaces: [String] {
         var out: [String] = []
@@ -483,6 +650,7 @@ final class PacketCapture: ObservableObject {
 
     func start() {
         stopProcess()
+        refreshContext()
         source = iface
         run(["-i", iface, "-p", "-U", "-n", "-s", "2048", "-w", "-"], live: true)
     }
@@ -499,6 +667,7 @@ final class PacketCapture: ObservableObject {
     func clear() {
         lock.lock(); pending.removeAll(); lock.unlock()
         packets = []; total = 0; counts = [:]; rate = 0
+        conversations = [:]; lockedBytes = 0; readableBytes = 0
     }
 
     /// Adds the user to access_bpf after the system asks for an admin password.
@@ -516,6 +685,9 @@ final class PacketCapture: ObservableObject {
         clear()
         state = .demo
         source = "en0"
+        localIPs = ["192.168.1.23", "2001:db8::23"]; gateway = "192.168.1.1"; names = [:]
+        let safari = (name: "Safari", path: "/Applications/Safari.app/Contents/MacOS/Safari")
+        ports = [52344: safari, 61200: safari, 52350: (name: "curl", path: "/usr/bin/curl")]
         let frames = Self.demoFrames.map { hex in stride(from: 0, to: hex.count, by: 2).map { i -> UInt8 in
             let s = hex.index(hex.startIndex, offsetBy: i)
             return UInt8(hex[s..<hex.index(s, offsetBy: 2)], radix: 16) ?? 0
@@ -600,8 +772,16 @@ final class PacketCapture: ObservableObject {
         rate = rate * 0.6 + Double(batch.count) * 4 * 0.4
         guard !batch.isEmpty else { return }
         total += batch.count
-        for p in batch { counts[p.proto, default: 0] += 1 }
-        packets.append(contentsOf: batch)
+        if state == .running, Date().timeIntervalSince(portsAt) > 3 {
+            portsAt = Date()
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let m = Self.portApps()
+                DispatchQueue.main.async { self?.ports = m }
+            }
+        }
+        let done = batch.map(finish)
+        for p in done { counts[p.proto, default: 0] += 1; tally(p) }
+        packets.append(contentsOf: done)
         if packets.count > Self.keep { packets.removeFirst(packets.count - Self.keep) }
     }
 
@@ -634,6 +814,133 @@ final class PacketCapture: ObservableObject {
         if i > 0 { buf.removeFirst(i) }
     }
 
+    private func tally(_ p: Packet) {
+        if p.appBytes > 0 { if p.encrypted { lockedBytes += p.appBytes } else { readableBytes += p.appBytes } }
+        let remote = p.sent == false ? p.srcIP : p.dstIP
+        guard !remote.isEmpty else { return }
+        let rport = p.sent == false ? p.sport : p.dport
+        let service = p.proto == "HTTP/3" ? "HTTP/3" : PacketDecoder.knownPorts[rport] ?? p.proto
+        let key = remote + "|" + service
+        var c = conversations[key] ?? Conversation(id: key, remoteIP: remote, name: "", service: service, first: p.time, last: p.time)
+        c.name = friendly(remote)
+        if !p.app.isEmpty { c.app = p.app; c.appPath = p.appPath }
+        c.top = max(c.top, p.top)
+        c.packets += 1
+        if p.sent == false { c.bytesIn += p.wireLength } else { c.bytesOut += p.wireLength }
+        if p.appBytes > 0 { if p.encrypted { c.encrypted = true } else { c.readable = true } }
+        c.last = p.time
+        conversations[key] = c
+    }
+
+    /// Writes the packets in memory as a classic .pcap file (opens in Wireshark).
+    func save(to url: URL) throws {
+        var d = Data()
+        func le32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        func le16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        le32(0xa1b2c3d4); le16(2); le16(4); le32(0); le32(0); le32(65535); le32(packets.first?.link ?? 1)
+        for p in packets {
+            let t = p.time.timeIntervalSince1970
+            le32(UInt32(t)); le32(UInt32((t - floor(t)) * 1e6)); le32(UInt32(p.bytes.count)); le32(UInt32(p.wireLength))
+            d.append(contentsOf: p.bytes)
+        }
+        try d.write(to: url)
+    }
+
+    /// Local port → app name for this user's sockets (lsof can't see other users' processes without root).
+    static func portApps() -> [Int: (name: String, path: String)] {
+        var m: [Int: (name: String, path: String)] = [:]
+        var cmd = "", path = "", pid: Int32 = 0
+        for line in shell("/usr/sbin/lsof", ["-nP", "+c", "0", "-iTCP", "-iUDP", "-F", "pcn"]).split(separator: "\n") {
+            if line.hasPrefix("p") { pid = Int32(line.dropFirst()) ?? 0 }
+            else if line.hasPrefix("c") {
+                var name = String(line.dropFirst())
+                var buf = [CChar](repeating: 0, count: 4096)
+                path = proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 ? String(cString: buf) : ""
+                // Some CLIs install as ".../tool/versions/1.2.3": name them after the folder instead.
+                if name.range(of: "^[0-9.]+$", options: .regularExpression) != nil, !path.isEmpty {
+                    let parts = path.split(separator: "/").map(String.init)
+                    name = parts.dropLast().last { !["versions", "bin", "libexec", "current"].contains($0) } ?? name
+                }
+                cmd = prettyApp(name)
+            }
+            else if line.hasPrefix("n") {
+                let local = line.dropFirst().components(separatedBy: "->")[0]
+                if let port = Int(local.split(separator: ":").last ?? ""), port > 0 { m[port] = (cmd, path) }
+            }
+        }
+        return m
+    }
+
+    static func prettyApp(_ c: String) -> String {
+        let known = ["com.apple.WebKit.Networking": "Safari", "com.apple.Safari": "Safari", "Google Chrome": "Chrome", "Microsoft Edge": "Edge",
+                     "Brave Browser": "Brave", "firefox": "Firefox", "Arc": "Arc", "Code Helper": "VS Code", "Cursor Helper": "Cursor",
+                     "Slack": "Slack", "Discord": "Discord", "Spotify": "Spotify", "zoom.us": "Zoom", "node": "Node.js", "python3": "Python",
+                     "Python": "Python", "ollama": "Ollama", "Claude": "Claude", "claude": "Claude Code", "Telegram": "Telegram", "WhatsApp": "WhatsApp"]
+        if let v = known[c] { return v }
+        if let hit = known.first(where: { c.hasPrefix($0.key) }) { return hit.value }
+        if let r = c.range(of: " Helper") { return String(c[..<r.lowerBound]) }
+        return c
+    }
+
+    /// Fills in who's who: "your Mac", "your router", names learned earlier, and the finished story.
+    private func finish(_ p: Packet) -> Packet {
+        var p = p
+        for l in p.learned where !l.ip.isEmpty { names[l.ip] = l.name }
+        p.srcName = friendly(p.srcIP); p.dstName = friendly(p.dstIP)
+        p.sent = localIPs.contains(p.srcIP) ? true : localIPs.contains(p.dstIP) ? false : nil
+        if let local = p.sent.map({ $0 ? p.sport : p.dport }), let app = ports[local] {
+            p.app = app.name; p.appPath = app.path
+            if p.sent == true { p.srcName = "\(app.name) on your Mac" } else { p.dstName = "\(app.name) on your Mac" }
+        }
+        var text = p.story
+        if text.hasPrefix("{S}") { text = cap(p.srcName) + text.dropFirst(3) }
+        p.story = text.replacingOccurrences(of: "{S}", with: p.srcName).replacingOccurrences(of: "{D}", with: p.dstName)
+        return p
+    }
+
+    /// Capitalise "your Mac" at the start of a sentence, but never a domain like "example.com".
+    private func cap(_ s: String) -> String {
+        ["your", "a", "the", "everyone", "nearby"].contains(String(s.split(separator: " ").first ?? "")) ? s.prefix(1).uppercased() + s.dropFirst() : s
+    }
+
+    func friendly(_ ip: String) -> String {
+        if ip.isEmpty { return "a device" }
+        if localIPs.contains(ip) { return "your Mac" }
+        if ip == gateway { return "your router" }
+        if let n = names[ip] { return n }
+        if ip == "broadcast" || ip == "255.255.255.255" { return "everyone on your network" }
+        if ip == "0.0.0.0" || ip == "::" { return "a device with no address yet" }
+        if ip == "224.0.0.251" || ip == "ff02::fb" { return "nearby devices (Bonjour)" }
+        if ip == "239.255.255.250" || ip == "ff02::c" { return "nearby smart devices" }
+        if ip.hasPrefix("ff") || (Int(ip.split(separator: ".").first ?? "") ?? 0) >= 224 { return "a group of nearby devices" }
+        let o = ip.split(separator: ".").compactMap { Int($0) }
+        let lan = ip.hasPrefix("fe80") || ip.hasPrefix("fd") || (o.count == 4 && (o[0] == 10 || (o[0] == 192 && o[1] == 168) || (o[0] == 172 && (16...31).contains(o[1])) || o[0] == 127))
+        return lan ? "a device on your network (\(ip))" : "the server \(ip)"
+    }
+
+    private func refreshContext() {
+        var ips = Set<String>()
+        var ifa: UnsafeMutablePointer<ifaddrs>?
+        if getifaddrs(&ifa) == 0 {
+            var p = ifa
+            while let i = p {
+                if let a = i.pointee.ifa_addr {
+                    var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    let len = socklen_t(a.pointee.sa_family == UInt8(AF_INET6) ? MemoryLayout<sockaddr_in6>.size : MemoryLayout<sockaddr_in>.size)
+                    if [UInt8(AF_INET), UInt8(AF_INET6)].contains(a.pointee.sa_family),
+                       getnameinfo(a, len, &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+                        ips.insert(String(cString: host).components(separatedBy: "%").first ?? "")
+                    }
+                }
+                p = i.pointee.ifa_next
+            }
+            freeifaddrs(ifa)
+        }
+        localIPs = ips
+        gateway = Self.shell("/sbin/route", ["-n", "get", "default"]).split(separator: "\n")
+            .first { $0.contains("gateway:") }?.split(separator: ":").last?.trimmingCharacters(in: .whitespaces) ?? ""
+    }
+
     private static func shell(_ path: String, _ args: [String]) -> String {
         let p = Process(), out = Pipe()
         p.executableURL = URL(fileURLWithPath: path); p.arguments = args; p.standardOutput = out; p.standardError = Pipe()
@@ -652,10 +959,15 @@ final class PacketCapture: ObservableObject {
         "8e2f0b00c0023a1c5e00a1010800450000281c46400040062804c0a801175db8d70ecc7801bb000003e900001b595010ffff00000000",
         "8e2f0b00c0023a1c5e00a1010800450000ad1c4640004006277fc0a801175db8d70ecc7801bb000003e900001b595018ffff0000000016030100800100007c0303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f00061301130213030100002d00000010000e00000b6578616d706c652e636f6d0010000e000c02683208687474702f312e31002b0003020304",
         "3a1c5e00a1018e2f0b00c00208004500008d1c46400038062f9f5db8d70ec0a8011701bbcc78000023f00000046e5018ffff0000000017030300600b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6",
+        "3a1c5e00a1018e2f0b00c0020800450004dd1c46400038062b4f5db8d70ec0a8011701bbcc78000024550000046e5010ffff0000000017030304b0073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d42",
+        "3a1c5e00a1018e2f0b00c0020800450004dd1c46400038062b4f5db8d70ec0a8011701bbcc780000290a0000046e5010ffff0000000017030304b0073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d42",
+        "3a1c5e00a1018e2f0b00c0020800450004dd1c46400038062b4f5db8d70ec0a8011701bbcc7800002dbf0000046e5010ffff0000000017030304b0073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d42",
+        "3a1c5e00a1018e2f0b00c0020800450004dd1c46400038062b4f5db8d70ec0a8011701bbcc78000032740000046e5010ffff0000000017030304b0073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d4277ace1164b80b5ea1f5489bef3285d92c7fc31669bd0053a6fa4d90e4378ade2174c81b6eb20558abff4295e93c8fd32679cd1063b70a5da0f4479aee3184d82b7ec21568bc0f52a5f94c9fe33689dd2073c71a6db10457aafe4194e83b8ed22578cc1f62b6095caff34699ed3083d72a7dc11467bb0e51a4f84b9ee23588dc2f72c6196cb00356a9fd4093e73a8dd12477cb1e61b5085baef24598ec3f82d6297cc01366ba0d50a3f74a9de13487db2e71c5186bbf0255a8fc4f92e6398cd02376ca1d60b4075aadf14497eb3e81d5287bcf1265b90c5fa2f6499ce03386da2d70c4176abe0154a7fb4e91e5388bdf2275c91c6fb30659acf04396ea3d80d42",
+        "8e2f0b00c0023a1c5e00a1010800450000281c46400040062804c0a801175db8d70ecc7801bb0000046e000037295010ffff00000000",
         "8e2f0b00c0023a1c5e00a10108004500007c1c464000400627b0c0a801175db8d70ecc7e00500000138800001f405018ffff00000000474554202f696e6465782e68746d6c20485454502f312e310d0a486f73743a206578616d706c652e636f6d0d0a557365722d4167656e743a206375726c2f382e372e310d0a4163636570743a202a2f2a0d0a0d0a",
         "8e2f0b00c0023a1c5e00a10108004500004c1c46400040015aaac0a80117010101010800b3911a2b0001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
         "8e2f0b00c0023a1c5e00a10186dd60000000006a114020010db800000000000000000000002326062800021fcb07682080daaf6b8b2cef1001bb006a0000c300000001080001020304050607000044d0000d1a2734414e5b6875828f9ca9b6c3d0ddeaf704111e2b3845525f6c798693a0adbac7d4e1eefb0815222f3c495663707d8a97a4b1becbd8e5f2ff0c192633404d5a6774818e9ba8b5c2cfdce9f603",
         "01005e0000fb3a1c5e00a1010800450000411c464000ff11bcaac0a80117e00000fb14e914e9002d0000000000000001000000000000085f616972706c6179045f746370056c6f63616c00000c0001",
-        "8e2f0b00c0023a1c5e00a1010800450000281c46400040062804c0a801175db8d70ecc7801bb0000046e000024505011ffff00000000",
+        "8e2f0b00c0023a1c5e00a1010800450000281c46400040062804c0a801175db8d70ecc7801bb0000046e000037295011ffff00000000",
     ]
 }

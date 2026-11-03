@@ -57,31 +57,32 @@ func wave(_ base: Double, _ amp: Double, _ seed: Double) -> [Double] {
     let cap = PacketCapture()
     cap.loadDemo(animated: false)
     let pkt = cap.packets[6]
-    save(VStack(alignment: .leading, spacing: 0) {
-        PacketHeader(cap: cap, filter: .constant("")).padding(.horizontal, 24).padding(.vertical, 14)
-        VStack(spacing: 0) {
-            PacketColumns(no: "No.", time: "Time", src: "Source", dst: "Destination", proto: "Protocol", len: "Length", info: "Info")
-                .font(.system(size: 11, weight: .semibold)).foregroundStyle(Theme.tertiary).padding(.vertical, 7)
-            Divider1()
-            ForEach(cap.packets) { PacketRow(packet: $0, t0: cap.packets.first?.time, selected: $0.id == pkt.id) }
-        }
-        .background(Theme.surface)
-        VStack(alignment: .leading, spacing: 14) {
-            EncapsulationBar(packet: pkt, focus: .constant(6))
-            HStack(alignment: .top, spacing: 16) {
-                OSIStack(packet: pkt, focus: .constant(6))
-                BytesPanel(packet: pkt, focus: 6, perRow: 16).frame(width: 392, height: 330)
-            }
-        }
-        .padding(24)
-    }.background(Theme.bg), "packets", width: 1120)
-    for (k, perRow) in [(6, 16), (10, 8)] {
-        let bp = BytesPanel(packet: cap.packets[k], focus: k == 6 ? 6 : nil, perRow: perRow)
-        let n = cap.packets[k].bytes.count, own = bp.owners(n)
-        save(VStack(alignment: .leading, spacing: 2) {
-            ForEach(Array(stride(from: 0, to: n, by: perRow)), id: \.self) { bp.row($0, min($0 + perRow, n), own) }
-        }.padding(14).background(Theme.surface), "hex-\(k)", width: perRow == 16 ? 392 : 228)
+    print("demo packets:", cap.packets.count)
+    save(VStack(spacing: 0) {
+        ForEach(StoryItem.group(cap.packets.filter { !$0.noise })) { StoryRow(item: $0, t0: cap.packets.first?.time, selected: $0.id == pkt.id) }
+    }.background(Theme.surface), "stories", width: 900)
+    save(VStack(spacing: 0) {
+        let list = cap.conversations.values.sorted { $0.bytesIn + $0.bytesOut > $1.bytesIn + $1.bytesOut }
+        ForEach(list) { ConversationRow(c: $0, peak: list.map { $0.bytesIn + $0.bytesOut }.max() ?? 1, now: cap.packets.last!.time); Divider1(inset: 54) }
+    }.background(Theme.surface), "conversations", width: 900)
+    save(PacketHeader(cap: cap, filter: .constant(""), mode: .constant(.stories), quick: .constant(.all)).padding(24).background(Theme.bg), "header", width: 1100)
+    save(VStack(alignment: .leading, spacing: 22) {
+        StoryCard(packet: pkt, t0: cap.packets.first?.time)
+        JourneyView(packet: pkt, frozenStep: 3)
+    }.padding(24).background(Theme.bg), "story-journey", width: 900)
+    for (k, st) in [(6, 9), (6, 7), (0, 1), (2, 12)] {
+        save(JourneyView(packet: cap.packets[k], frozenStep: st).padding(20).background(Theme.bg), "journey-\(k)-\(st)", width: 760)
     }
+    save(OSIStack(packet: pkt, focus: .constant(nil)).padding(20).background(Theme.bg), "stack", width: 640)
+    save(StoryCard(packet: cap.packets[1], t0: cap.packets.first?.time).padding(20).background(Theme.bg), "card-dns", width: 760)
+    var expanded = pkt.layer(4)
+    save(VStack(spacing: 5) {
+        LayerRow(layer: expanded, expanded: true)
+        LayerRow(layer: pkt.layer(3), expanded: true)
+    }.padding(20).background(Theme.bg), "layers", width: 620)
+    expanded = cap.packets[2].layer(7)
+    save(LayerRow(layer: expanded, expanded: true).padding(20).background(Theme.bg), "layer-dns", width: 620)
+    save(OSIGuide(showDemo: true).content.background(Theme.bg), "guide", width: 820)
     save(PermissionBanner(cap: cap).padding(20).background(Theme.bg), "packets-permission", width: 900)
 }
 

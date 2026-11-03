@@ -11,7 +11,14 @@ A small native macOS app that shows what is downloading on your Mac right now �
 - **Network activity** — every process using the network, its speed and its full command line, with the real app icon when there is one.
 - **Machines** — this Mac plus any SSH host you add in the sidebar (uses your `~/.ssh/config` aliases and keys).
 - **Menu bar** — total download speed, and the top files per machine in a popover.
-- **Packets** — a live packet list where each packet is split into the 7 OSI layers (Ethernet, IP, TCP/UDP, TLS, DNS, HTTP, QUIC…), with a header-by-header bar and a hex dump coloured by layer. Reads from `tcpdump`, opens `.pcap`/`.pcapng` files, and has demo packets.
+- **Packets** — see what your Mac is saying on the network, explained for anyone:
+  - **Stories**: each packet as one plain sentence ("Safari on your Mac started a secure, encrypted conversation with example.com"), with why it happens. Repeats fold into one line, and TCP "got it" replies hide by default.
+  - **App**: which app sent or received each packet (matched by port with `lsof`), with its real icon.
+  - **Journey**: an animation of the packet going down your Mac's 7 OSI layers, picking up a header at each one, across the wire, and up the other side.
+  - **Inside the packet**: every layer, what it adds (bytes and fields), a letter-in-the-post analogy, and what each value means; plus a header bar and a hex dump coloured by layer.
+  - **Conversations**: who your Mac is talking to, busiest first, with the app, the service and whether it was encrypted.
+  - Quick filters (Websites, Name lookups, Nearby devices, Encrypted, Readable), an "encrypted %" meter, a classic table view, `.pcap`/`.pcapng` open and save, and demo packets.
+  Decodes Ethernet, ARP, IPv4/6, ICMP, TCP, UDP, DNS/mDNS, TLS (server name), QUIC/HTTP/3, HTTP, SSH, DHCP and SSDP.
 
 ### Packet capture permission
 
