@@ -11,6 +11,11 @@ A small native macOS app that shows what is downloading on your Mac right now �
 - **Network activity** — every process using the network, its speed and its full command line, with the real app icon when there is one.
 - **Machines** — this Mac plus any SSH host you add in the sidebar (uses your `~/.ssh/config` aliases and keys).
 - **Menu bar** — total download speed, and the top files per machine in a popover.
+- **Packets** — a live packet list where each packet is split into the 7 OSI layers (Ethernet, IP, TCP/UDP, TLS, DNS, HTTP, QUIC…), with a header-by-header bar and a hex dump coloured by layer. Reads from `tcpdump`, opens `.pcap`/`.pcapng` files, and has demo packets.
+
+### Packet capture permission
+
+macOS only lets members of the `access_bpf` group read packets. If you have Wireshark's ChmodBPF installed, the **Allow capture…** button adds you to that group (it asks for your password). Without ChmodBPF, install it from `Wireshark.app/Contents/Resources/Extras`. Dolkoon captures in non-promiscuous mode, so it only sees this Mac's own traffic.
 
 ## How it works
 

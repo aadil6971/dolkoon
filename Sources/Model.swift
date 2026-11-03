@@ -100,6 +100,8 @@ final class Host: ObservableObject, Identifiable, Hashable {
 final class AppModel: ObservableObject {
     @Published var hosts: [Host] = []
     @Published var selection: Host?
+    @Published var showPackets = false
+    let capture = PacketCapture()
     @AppStorage("extraHosts") private var extraHosts = ""
 
     init() {

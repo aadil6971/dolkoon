@@ -9,7 +9,8 @@ struct RootView: View {
         } detail: {
             ZStack {
                 Theme.bg.ignoresSafeArea()
-                if let h = model.selection { HostView(host: h) } else { Text("Pick a machine").foregroundStyle(Theme.secondary) }
+                if model.showPackets { PacketView(cap: model.capture) }
+                else if let h = model.selection { HostView(host: h) } else { Text("Pick a machine").foregroundStyle(Theme.secondary) }
             }
         }
         .tint(Theme.accent)
@@ -24,11 +25,16 @@ struct Sidebar: View {
             Text("Machines").font(.system(size: 11, weight: .semibold)).foregroundStyle(Theme.tertiary)
                 .padding(.horizontal, 12).padding(.top, 8).padding(.bottom, 4)
             ForEach(model.hosts) { h in
-                HostRow(host: h, selected: model.selection == h)
+                HostRow(host: h, selected: !model.showPackets && model.selection == h)
                     .contentShape(Rectangle())
-                    .onTapGesture { model.selection = h }
+                    .onTapGesture { model.selection = h; model.showPackets = false }
                     .contextMenu { if h.ssh != nil { Button("Remove \(h.name)") { model.remove(h) } } }
             }
+            Text("Inspect").font(.system(size: 11, weight: .semibold)).foregroundStyle(Theme.tertiary)
+                .padding(.horizontal, 12).padding(.top, 14).padding(.bottom, 4)
+            PacketsSidebarRow(cap: model.capture, selected: model.showPackets)
+                .contentShape(Rectangle())
+                .onTapGesture { model.showPackets = true }
             Spacer()
             HStack(spacing: 7) {
                 Image(systemName: "plus").font(.system(size: 11, weight: .semibold)).foregroundStyle(Theme.tertiary)

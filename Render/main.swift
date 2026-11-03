@@ -53,6 +53,36 @@ func wave(_ base: Double, _ amp: Double, _ seed: Double) -> [Double] {
         HostRow(host: local); HostRow(host: h, selected: true)
     }.padding(12).background(Theme.sidebar), "sidebar", width: 240)
     save(VStack(spacing: 10) { MenuHost(host: local); MenuHost(host: h) }.padding(16).background(Theme.bg), "menu", width: 340)
+
+    let cap = PacketCapture()
+    cap.loadDemo(animated: false)
+    let pkt = cap.packets[6]
+    save(VStack(alignment: .leading, spacing: 0) {
+        PacketHeader(cap: cap, filter: .constant("")).padding(.horizontal, 24).padding(.vertical, 14)
+        VStack(spacing: 0) {
+            PacketColumns(no: "No.", time: "Time", src: "Source", dst: "Destination", proto: "Protocol", len: "Length", info: "Info")
+                .font(.system(size: 11, weight: .semibold)).foregroundStyle(Theme.tertiary).padding(.vertical, 7)
+            Divider1()
+            ForEach(cap.packets) { PacketRow(packet: $0, t0: cap.packets.first?.time, selected: $0.id == pkt.id) }
+        }
+        .background(Theme.surface)
+        VStack(alignment: .leading, spacing: 14) {
+            EncapsulationBar(packet: pkt, focus: .constant(6))
+            HStack(alignment: .top, spacing: 16) {
+                OSIStack(packet: pkt, focus: .constant(6))
+                BytesPanel(packet: pkt, focus: 6, perRow: 16).frame(width: 392, height: 330)
+            }
+        }
+        .padding(24)
+    }.background(Theme.bg), "packets", width: 1120)
+    for (k, perRow) in [(6, 16), (10, 8)] {
+        let bp = BytesPanel(packet: cap.packets[k], focus: k == 6 ? 6 : nil, perRow: perRow)
+        let n = cap.packets[k].bytes.count, own = bp.owners(n)
+        save(VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(stride(from: 0, to: n, by: perRow)), id: \.self) { bp.row($0, min($0 + perRow, n), own) }
+        }.padding(14).background(Theme.surface), "hex-\(k)", width: perRow == 16 ? 392 : 228)
+    }
+    save(PermissionBanner(cap: cap).padding(20).background(Theme.bg), "packets-permission", width: 900)
 }
 
 MainActor.assumeIsolated { run() }
